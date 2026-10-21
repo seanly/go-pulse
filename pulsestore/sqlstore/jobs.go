@@ -272,6 +272,32 @@ func (s *Store) Requeue(ctx context.Context, id, reason string, maxRequeues int)
 	return err
 }
 
+// FailTerminal fails a job outright, whatever its remaining attempts.
+//
+// No status filter on 'leased': the dispatcher calls this for a job it has
+// just leased, but an application may also give up on one that is still
+// pending. Only an already-finished job is refused.
+func (s *Store) FailTerminal(ctx context.Context, id, reason string) error {
+	list, args := placeholders([]string{
+		pulse.JobDone, pulse.JobFailed, pulse.JobExpired, pulse.JobCancelled,
+	})
+	args = append([]any{pulse.JobFailed, truncate(reason, 1000), s.now(), id}, args...)
+	err := s.execOne(ctx, `
+		UPDATE `+s.table("jobs")+`
+		   SET status = ?, last_error = ?, finished_at = ?, lease_expires_at = NULL
+		 WHERE id = ? AND status NOT IN (`+list+`)`, args...)
+	if errors.Is(err, pulse.ErrNotFound) {
+		if _, getErr := s.GetJob(ctx, id); getErr != nil {
+			return getErr
+		}
+		return fmt.Errorf("sqlstore: job %s already finished: %w", id, pulse.ErrConflict)
+	}
+	if err != nil {
+		return fmt.Errorf("sqlstore: fail job terminally: %w", err)
+	}
+	return nil
+}
+
 // Cancel terminates a job that is no longer wanted.
 func (s *Store) Cancel(ctx context.Context, id, reason string) error {
 	list, args := placeholders([]string{

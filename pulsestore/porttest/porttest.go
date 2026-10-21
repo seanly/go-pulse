@@ -45,7 +45,39 @@ type Stores struct {
 	// CreateAgent inserts an agent row directly, bypassing enrollment. Needed
 	// because most tests want an agent without minting a token first.
 	CreateAgent func(ctx context.Context, a *pulse.Agent) error
+	// PrepareJobFixtures creates whatever rows the implementation's foreign
+	// keys require before the job tests enqueue anything, for the agent and
+	// subject IDs the suite is about to use.
+	//
+	// The reference store has no foreign keys and leaves this nil. An adapter
+	// over an existing schema usually does have them — an application that
+	// already has agent and subject tables will have pointed its job table at
+	// both — and an enqueue of a job naming rows that do not exist fails on
+	// the constraint. This hook is how such an implementation says what it
+	// needs, rather than the suite quietly assuming referential integrity is
+	// somebody else's problem.
+	PrepareJobFixtures func(ctx context.Context, agentIDs, subjectIDs []string) error
+	// Skip names contract cases this implementation knowingly does not
+	// satisfy, mapped to the reason why.
+	//
+	// An adapter over a schema that predates the framework sometimes has a
+	// deliberate divergence, and both alternatives to recording it here are
+	// worse: the case quietly missing from the run, or the whole suite
+	// abandoned over one disagreement. A skip must name the case and say why,
+	// which keeps the gap in front of whoever reads the test next.
+	//
+	// Keys are the subtest names Run uses.
+	Skip map[string]string
 }
+
+// FixtureAgentIDs and FixtureSubjectIDs are the identifiers the job tests use.
+//
+// Declared up front so PrepareJobFixtures can create them all at once, and so
+// an implementation does not have to guess at the suite's naming.
+var (
+	FixtureAgentIDs   = []string{"a1", "a2"}
+	FixtureSubjectIDs = []string{"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"}
+)
 
 // Clock is a controllable clock: the suite reads it to build timestamps on the
 // store's timeline and advances it to make deadlines pass.
@@ -87,6 +119,7 @@ func Run(t *testing.T, newStores Factory) {
 		{"FailRetriesThenTerminates", testFailRetries},
 		{"RequeueDoesNotBurnAttempts", testRequeueAttempts},
 		{"RequeueCeilingFailsTheJob", testRequeueCeiling},
+		{"FailTerminalIgnoresAttempts", testFailTerminal},
 		{"ReclaimRequeuesAndExpires", testReclaim},
 		{"CancelIsTerminal", testCancel},
 		{"CountsReflectStatus", testCounts},
@@ -94,7 +127,13 @@ func Run(t *testing.T, newStores Factory) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.fn(t, newStores(t))
+			stores := newStores(t)
+			if reason, skipped := stores.Skip[tc.name]; skipped {
+				// Reported rather than silently passed: a divergence nobody
+				// can see is one nobody will revisit.
+				t.Skipf("known divergence: %s", reason)
+			}
+			tc.fn(t, stores)
 		})
 	}
 }
@@ -158,13 +197,33 @@ func enqueue(t *testing.T, s Stores, jobs ...*pulse.Job) {
 		if j.MaxAttempts == 0 {
 			j.MaxAttempts = 3
 		}
+		if j.SubjectID == "" {
+			// Every job names a subject: an implementation whose job table has
+			// a foreign key to its own subject table cannot store one that
+			// does not.
+			j.SubjectID = FixtureSubjectIDs[0]
+		}
 		if j.CreatedAt.IsZero() {
 			// Distinct, increasing timestamps so FIFO order is well defined.
 			j.CreatedAt = time.Now().UTC().Add(time.Duration(len(j.ID)) * time.Millisecond)
 		}
 	}
+	prepareFixtures(t, s)
 	if err := s.Jobs.Enqueue(ctx(), jobs); err != nil {
 		t.Fatalf("enqueue: %v", err)
+	}
+}
+
+// prepareFixtures creates the rows an implementation's foreign keys need. It is
+// called before every enqueue and must be idempotent on the implementation's
+// side, which is cheaper than threading setup through every test.
+func prepareFixtures(t *testing.T, s Stores) {
+	t.Helper()
+	if s.PrepareJobFixtures == nil {
+		return
+	}
+	if err := s.PrepareJobFixtures(ctx(), FixtureAgentIDs, FixtureSubjectIDs); err != nil {
+		t.Fatalf("prepare job fixtures: %v", err)
 	}
 }
 

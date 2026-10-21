@@ -155,6 +155,17 @@ type JobStore interface {
 	// remain, so a transient error retries rather than being reported as a
 	// real result. Past MaxAttempts it becomes JobFailed.
 	Fail(ctx context.Context, id, reason string) error
+	// FailTerminal fails a job outright, ignoring its remaining attempts.
+	//
+	// For work that provably cannot succeed: the subject was deleted, the
+	// payload cannot be built, the job asks for something impossible.
+	// Retrying it would cost a dispatch pass and a write per attempt to reach
+	// the same end state, and would leave a misleading trail of "failures" for
+	// something that was never attempted.
+	//
+	// Unlike Cancel this lands on JobFailed, because "nobody wanted this" and
+	// "this could never work" are different things to read in a job history.
+	FailTerminal(ctx context.Context, id, reason string) error
 	// Requeue hands a job back WITHOUT burning an attempt, for when no work
 	// happened at all: the agent was full, or the push failed. Counting those
 	// as attempts would let a misconfigured concurrency exhaust the retry

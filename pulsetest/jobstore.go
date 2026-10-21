@@ -191,6 +191,28 @@ func (s *Store) Requeue(_ context.Context, id, reason string, maxRequeues int) e
 	return nil
 }
 
+// FailTerminal fails a job outright, whatever its remaining attempts.
+func (s *Store) FailTerminal(_ context.Context, id, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.taken(); err != nil {
+		return err
+	}
+	j, ok := s.jobs[id]
+	if !ok {
+		return fmt.Errorf("job %s: %w", id, pulse.ErrNotFound)
+	}
+	switch j.Status {
+	case pulse.JobDone, pulse.JobFailed, pulse.JobExpired, pulse.JobCancelled:
+		return fmt.Errorf("job %s already finished as %s: %w", id, j.Status, pulse.ErrConflict)
+	}
+	j.Status = pulse.JobFailed
+	j.LastError = truncate(reason, 1000)
+	j.FinishedAt = s.now()
+	j.LeaseExpiresAt = time.Time{}
+	return nil
+}
+
 func (s *Store) Cancel(_ context.Context, id, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

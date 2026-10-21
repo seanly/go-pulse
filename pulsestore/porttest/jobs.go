@@ -344,6 +344,49 @@ func testReclaim(t *testing.T, s Stores) {
 	}
 }
 
+func testFailTerminal(t *testing.T, s Stores) {
+	// A job with plenty of attempts left, for work that provably cannot
+	// succeed — a deleted subject, an unbuildable payload.
+	enqueue(t, s, &pulse.Job{ID: "j1", AgentID: "a1", MaxAttempts: 5})
+	if _, err := s.Jobs.Lease(ctx(), "a1", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Jobs.FailTerminal(ctx(), "j1", "subject deleted"); err != nil {
+		t.Fatalf("FailTerminal: %v", err)
+	}
+	j, err := s.Jobs.GetJob(ctx(), "j1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The remaining attempts are ignored: retrying would spend a dispatch pass
+	// and a write each to reach exactly this state.
+	if j.Status != pulse.JobFailed {
+		t.Errorf("status = %q, want failed despite 4 attempts remaining", j.Status)
+	}
+	if j.FinishedAt.IsZero() {
+		t.Error("finished_at not set")
+	}
+	if j.LastError != "subject deleted" {
+		t.Errorf("last error = %q", j.LastError)
+	}
+
+	// Already terminal: a second call is a conflict, not a silent overwrite.
+	if err := s.Jobs.FailTerminal(ctx(), "j1", "again"); !errors.Is(err, pulse.ErrConflict) {
+		t.Errorf("second FailTerminal = %v, want ErrConflict", err)
+	}
+
+	// A pending job can also be given up on, without being leased first.
+	enqueue(t, s, &pulse.Job{ID: "j2", AgentID: "a1", MaxAttempts: 5})
+	if err := s.Jobs.FailTerminal(ctx(), "j2", "subject deleted"); err != nil {
+		t.Errorf("FailTerminal on a pending job: %v", err)
+	}
+
+	if err := s.Jobs.FailTerminal(ctx(), "nope", "x"); !errors.Is(err, pulse.ErrNotFound) {
+		t.Errorf("FailTerminal on a missing job = %v, want ErrNotFound", err)
+	}
+}
+
 func testCancel(t *testing.T, s Stores) {
 	enqueue(t, s, &pulse.Job{ID: "j1", AgentID: "a1"}, &pulse.Job{ID: "j2", AgentID: "a1"})
 

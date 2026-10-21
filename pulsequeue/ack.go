@@ -170,6 +170,10 @@ func (d *Dispatcher) DispatchNow(ctx context.Context, jobID string) error {
 		d.requeue(ctx, j, "agent lookup failed")
 		return err
 	}
+	if !d.resolve(ctx, &j) {
+		// The resolver already put the job where it belongs.
+		return nil
+	}
 	if j.Timeout <= 0 {
 		j.Timeout = d.timeout
 	}

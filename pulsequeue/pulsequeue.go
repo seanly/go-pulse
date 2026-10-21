@@ -68,6 +68,21 @@ type Options struct {
 	// application can record that a subject stopped being worked on. A job
 	// that vanishes silently is worse than one that reports a failure.
 	OnExpired func(ctx context.Context, j pulse.Job)
+	// ResolvePayload, when set, is consulted for every job just before it is
+	// pushed, and decides what the agent receives — or that it should not be
+	// pushed at all.
+	//
+	// It exists because a payload stored at enqueue time is a snapshot. An
+	// application whose work is described by mutable state wants the state as
+	// it is now: a certificate probe should use the target's current port, and
+	// a deploy should resolve the current release. Both would otherwise have
+	// to re-enqueue every job after any edit.
+	//
+	// It also handles the cases where dispatch should stop: the subject was
+	// deleted, or disabled, or its lookup failed. See Decision.
+	//
+	// Nil means jobs are pushed with the payload they were enqueued with.
+	ResolvePayload PayloadResolver
 	// Logger receives framework events. Nil discards them.
 	Logger *slog.Logger
 	// Metrics receives counters. Nil discards them.
@@ -91,10 +106,11 @@ type Dispatcher struct {
 	configs  pulse.ConfigStore
 	registry pulse.Registry
 
-	onExpired func(context.Context, pulse.Job)
-	log       *slog.Logger
-	metrics   pulse.Metrics
-	clock     pulse.Clock
+	onExpired      func(context.Context, pulse.Job)
+	resolvePayload PayloadResolver
+	log            *slog.Logger
+	metrics        pulse.Metrics
+	clock          pulse.Clock
 
 	dispatchEvery time.Duration
 	reapEvery     time.Duration
@@ -134,20 +150,21 @@ func New(o Options) (*Dispatcher, error) {
 		o.Clock = pulse.SystemClock
 	}
 	d := &Dispatcher{
-		jobs:          o.Jobs,
-		agents:        o.Agents,
-		configs:       o.Configs,
-		registry:      o.Registry,
-		onExpired:     o.OnExpired,
-		log:           o.Logger,
-		metrics:       o.Metrics,
-		clock:         o.Clock,
-		dispatchEvery: orDefault(o.DispatchInterval, DefaultDispatchInterval),
-		reapEvery:     orDefault(o.ReaperInterval, DefaultReaperInterval),
-		batch:         orDefaultInt(o.Batch, DefaultBatch),
-		timeout:       orDefault(o.Timeout, DefaultTimeout),
-		maxRequeues:   orDefaultInt(o.MaxRequeues, DefaultMaxRequeues),
-		wake:          make(chan struct{}, 1),
+		jobs:           o.Jobs,
+		agents:         o.Agents,
+		configs:        o.Configs,
+		registry:       o.Registry,
+		onExpired:      o.OnExpired,
+		resolvePayload: o.ResolvePayload,
+		log:            o.Logger,
+		metrics:        o.Metrics,
+		clock:          o.Clock,
+		dispatchEvery:  orDefault(o.DispatchInterval, DefaultDispatchInterval),
+		reapEvery:      orDefault(o.ReaperInterval, DefaultReaperInterval),
+		batch:          orDefaultInt(o.Batch, DefaultBatch),
+		timeout:        orDefault(o.Timeout, DefaultTimeout),
+		maxRequeues:    orDefaultInt(o.MaxRequeues, DefaultMaxRequeues),
+		wake:           make(chan struct{}, 1),
 	}
 	return d, nil
 }
@@ -308,6 +325,11 @@ func (d *Dispatcher) quotaFor(ctx context.Context, agent pulse.Agent, cfg pulse.
 // pushed nor returned to the queue is invisible until the reaper notices,
 // which for a fresh lease is a whole lease period of nothing happening.
 func (d *Dispatcher) push(ctx context.Context, agent pulse.Agent, j pulse.Job) {
+	// Resolution comes first: it may replace the payload with current state,
+	// or decide this job must not be dispatched at all.
+	if !d.resolve(ctx, &j) {
+		return
+	}
 	if j.Timeout <= 0 {
 		j.Timeout = d.timeout
 	}
