@@ -1,0 +1,7 @@
+# The workspace lives in the parent directory and is per-developer; see
+# docs/issues/0001-module-skeleton.md.
+go.work
+go.work.sum
+
+bin/
+coverage.out

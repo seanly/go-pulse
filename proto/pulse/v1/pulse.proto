@@ -1,0 +1,210 @@
+// The agent protocol: enrollment, the long-lived connection, and results.
+//
+// This file is the contract between a go-pulse server and its agents. It
+// changes rarely and only additively — both sides may run versions that are
+// apart by a release, so field numbers are never reused and no field is
+// repurposed.
+//
+// Nothing here knows what the work is. A job carries an opaque payload the
+// framework moves but never reads; probing a certificate, running a build and
+// executing an ops action are all the same shape at this layer. See
+// docs/design.md §2 for why that trade is worth making.
+syntax = "proto3";
+
+package pulse.v1;
+
+option go_package = "github.com/seanly/go-pulse/pb/pulse/v1;pulsev1";
+
+// AgentService is the server-facing surface every agent calls. Agents always
+// dial out; the server never connects to an agent.
+service AgentService {
+  // Register exchanges a one-time bootstrap token for a long-lived credential.
+  // Unauthenticated: the bootstrap token is the authentication.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Connect is the bidirectional stream: heartbeats and job acks up, jobs and
+  // commands down. Authenticated with the credential from Register.
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+
+  // ReportResult delivers one finished job. Idempotent per job_id: the server
+  // keeps the first result and ignores replays.
+  rpc ReportResult(ReportResultRequest) returns (ReportResultResponse);
+}
+
+message RegisterRequest {
+  // bootstrap_token is the single-use enrollment credential an operator minted
+  // for exactly this purpose.
+  string bootstrap_token = 1;
+  // name is the agent's stable identity. Re-registering the same name reuses
+  // the existing agent row rather than creating a duplicate.
+  string name = 2;
+  string version = 3;
+  map<string, string> labels = 4;
+  // local_config is what this agent's own configuration says. Reported so a
+  // console can show the local value beside each override box and display the
+  // switches the server is not allowed to push.
+  LocalConfig local_config = 5;
+  // capabilities are the job kinds this agent can execute. The server stores
+  // them and makes them queryable, but does NOT filter dispatch on them:
+  // choosing who gets a job is the application's decision, made at enqueue
+  // time. Declaring them lets that decision be an informed one.
+  repeated string capabilities = 6;
+}
+
+// LocalConfig is the agent's own configuration. Purely informational: the
+// server stores it to display, never to act on.
+message LocalConfig {
+  int32 concurrency = 1;
+  int32 qps = 2;
+  int32 timeout_ms = 3;
+  string log_level = 4;
+  // extra carries whatever else an application wants visible in its console —
+  // the local-only switches it does not accept pushes for, or counts of local
+  // policy entries. Strings because this is display data, not something any
+  // code branches on.
+  map<string, string> extra = 5;
+}
+
+message RegisterResponse {
+  string agent_id = 1;
+  // credential is a long-lived bearer token. The agent stores it and presents
+  // it on every subsequent call; it becomes invalid when the operator revokes
+  // the agent.
+  string credential = 2;
+  // effective_labels are what the server actually stored: agent-reported
+  // labels with server-side overrides applied, which win on conflict. Returned
+  // so the agent can say out loud that its local config is not the last word.
+  map<string, string> effective_labels = 3;
+}
+
+message AgentMessage {
+  oneof payload {
+    Heartbeat heartbeat = 1;
+    JobAck job_ack = 2;
+  }
+}
+
+// Heartbeat is sent every HeartbeatInterval. The server decides online/offline
+// from when the last one arrived, not from anything the heartbeat claims.
+message Heartbeat {
+  string version = 1;
+  // load is the agent's own load average, for display only.
+  double load = 2;
+  // running_jobs is how many jobs the agent is executing right now.
+  int32 running_jobs = 3;
+  // config_version is the AgentConfig version the agent currently has applied;
+  // 0 means it has never received one. Comparing it with the stored version is
+  // what lets a console say "in effect" rather than only "sent".
+  int64 config_version = 4;
+}
+
+// JobAck tells the server whether a dispatched job was accepted. A rejection
+// frees the job for another agent — or not, depending on the reason.
+message JobAck {
+  string job_id = 1;
+  bool accepted = 2;
+  // reason is a short stable code: "busy" (at capacity, try another agent),
+  // "rejected" (local policy refuses this job; another agent will not help),
+  // "unsupported_kind" (this agent cannot do this kind of work).
+  string reason = 3;
+}
+
+message ServerMessage {
+  oneof payload {
+    Job job = 1;
+    Command command = 2;
+    AgentConfig config = 3;
+  }
+}
+
+// AgentConfig is a policy override pushed from the server. An unset (zero or
+// empty) field always means "the server expresses no opinion, keep using the
+// local value", so pushing an empty AgentConfig is a safe no-op and clearing
+// an override needs no reconnect.
+//
+// An agent too old to know this payload falls through its oneof default, logs a
+// line and carries on: it never applies the override, which the server sees as
+// config_version staying where it was.
+message AgentConfig {
+  // version increases on every change; the agent echoes the applied version in
+  // its heartbeat. That is what makes a push verifiable rather than hopeful.
+  int64 version = 1;
+  // concurrency caps in-flight jobs; 0 means no override.
+  int32 concurrency = 2;
+  // qps caps job starts per second; 0 means no override.
+  int32 qps = 3;
+  // timeout_ms bounds one job; 0 means no override. Already-running jobs keep
+  // the timeout they started with.
+  int32 timeout_ms = 4;
+  // log_level is one of debug|info|warn|error; empty means no override.
+  string log_level = 5;
+  // payload is application-defined configuration, opaque to the framework.
+  // Conventionally a JSON object keyed by subsystem so independent consumers
+  // (pulseguard, the application itself) do not collide.
+  //
+  // A push is all-or-nothing: if a consumer rejects this payload, the whole
+  // message is discarded and the previous config stays in effect.
+  bytes payload = 6;
+}
+
+// Job is one unit of work to execute once. The agent re-derives nothing: the
+// payload is authoritative, and timeout_ms bounds how long it may take.
+message Job {
+  string job_id = 1;
+  // group_id is the batch this job belongs to, for the application's own
+  // accounting. Empty for standalone work.
+  string group_id = 2;
+  // subject_id names what the job acts on, so results can be correlated
+  // without decoding the payload.
+  string subject_id = 3;
+  // kind selects the executor. Empty is a valid kind: a single-purpose agent
+  // may register one unnamed executor and never set this.
+  string kind = 4;
+  // timeout_ms bounds the whole job. The agent takes the smaller of this and
+  // its own ceiling.
+  int32 timeout_ms = 5;
+  // attempt is which try this is, starting at 1. Informational: retries are
+  // the server's decision.
+  int32 attempt = 6;
+  // payload is the work itself, opaque to the framework.
+  bytes payload = 7;
+}
+
+message Command {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // reload asks the agent to re-read its local configuration.
+    KIND_RELOAD = 1;
+    // shutdown asks the agent to finish running jobs and exit.
+    KIND_SHUTDOWN = 2;
+  }
+  Kind kind = 1;
+}
+
+message ReportResultRequest {
+  string job_id = 1;
+  string group_id = 2;
+  string subject_id = 3;
+  string kind = 4;
+
+  // status is one of ok|warning|error|skipped. The framework uses it only to
+  // classify metrics; what "warning" means is the application's business.
+  string status = 5;
+  string error_code = 6;
+  string error_detail = 7;
+
+  // executed_at_unix is when the job ran on the agent, not when the report
+  // arrived; a reconnect can deliver results much later.
+  int64 executed_at_unix = 8;
+  // duration_ms is how long execution took.
+  int64 duration_ms = 9;
+
+  // payload is the application's result document, opaque to the framework.
+  bytes payload = 10;
+}
+
+message ReportResultResponse {
+  // accepted is false only when the server ignores the report (unknown job,
+  // already reported). The agent does not retry in that case.
+  bool accepted = 1;
+}

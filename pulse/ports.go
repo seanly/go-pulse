@@ -1,0 +1,246 @@
+package pulse
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// Sentinel errors every store implementation must use. They are part of the
+// port contract, not an implementation detail: the control plane has to tell
+// "no such agent" from "the database is down", and a lost race from a fault.
+//
+// Implementations wrap them (fmt.Errorf("...: %w", pulse.ErrNotFound)) and
+// callers test with errors.Is.
+var (
+	// ErrNotFound is returned by lookups that address a single row by
+	// identity.
+	ErrNotFound = errors.New("pulse: not found")
+	// ErrConflict is returned when a row exists but its state does not admit
+	// the requested transition — leasing a job someone else just took,
+	// completing a job whose lease was already reclaimed. These are normal
+	// races, not faults, and callers are expected to handle them.
+	ErrConflict = errors.New("pulse: state conflict")
+)
+
+// AgentStore persists agent identity and liveness.
+//
+// All methods are called concurrently from gRPC handlers and background loops.
+type AgentStore interface {
+	// GetAgent returns one agent by ID, ErrNotFound if there is none.
+	GetAgent(ctx context.Context, id string) (Agent, error)
+	// GetAgentByName returns one agent by name, ErrNotFound if there is none.
+	// Registration uses this to reuse a row rather than duplicate an identity.
+	GetAgentByName(ctx context.Context, name string) (Agent, error)
+	// ListAgents returns every agent, for console listings.
+	ListAgents(ctx context.Context) ([]Agent, error)
+	// ListDispatchableAgents returns agents eligible for work: online and not
+	// disabled. Dispatch calls this every pass, so it should be indexed.
+	ListDispatchableAgents(ctx context.Context) ([]Agent, error)
+	// UpdateAgentMeta writes the mutable identity fields of an existing agent.
+	// Labels must be recomputed from ReportedLabels and LabelOverrides by the
+	// implementation (see EffectiveLabels) so the derived column cannot drift.
+	UpdateAgentMeta(ctx context.Context, a *Agent) error
+	// SetLabelOverrides replaces the server-side label opinion for one agent
+	// and recomputes the effective set.
+	SetLabelOverrides(ctx context.Context, agentID string, overrides map[string]*string) error
+	// BumpTokenVersion revokes every credential issued for this agent by
+	// advancing its revocation counter, and returns the new value.
+	BumpTokenVersion(ctx context.Context, agentID string) (int, error)
+	// SetAgentStatus moves an agent between AgentOnline/Offline/Disabled.
+	SetAgentStatus(ctx context.Context, agentID, status string) error
+	// Heartbeat records liveness. The peer address comes from the connection,
+	// never from the payload. It flips a stale agent back to online.
+	Heartbeat(ctx context.Context, agentID, version, peerIP string) error
+	// MarkStaleAgentsOffline flips agents whose last heartbeat is older than
+	// staleFor and returns their IDs so the caller can log the transition.
+	//
+	// It must not touch those agents' jobs: a lease has its own expiry, and a
+	// network blip should not requeue work that is still running fine.
+	MarkStaleAgentsOffline(ctx context.Context, staleFor time.Duration) ([]string, error)
+	// DeleteAgent removes an agent. Its credentials must stop verifying
+	// immediately, which falls out of GetAgent returning ErrNotFound.
+	DeleteAgent(ctx context.Context, agentID string) error
+}
+
+// TokenStore persists bootstrap tokens and performs enrollment.
+type TokenStore interface {
+	// CreateBootstrapToken stores a token by hash. The plaintext is shown to
+	// the operator once and must never be persisted.
+	CreateBootstrapToken(ctx context.Context, t *BootstrapToken) error
+	// ListBootstrapTokens returns tokens for a console listing. TokenHash may
+	// be elided; the plaintext is gone either way.
+	ListBootstrapTokens(ctx context.Context) ([]BootstrapToken, error)
+	// DeleteBootstrapToken removes an unused token.
+	DeleteBootstrapToken(ctx context.Context, id string) error
+
+	// Enroll atomically writes the agent row and claims the token.
+	//
+	// Atomic because the claim records which agent used it, so the agent must
+	// exist first, and because an invalid token must leave nothing behind —
+	// not half an agent row. Implementations do this in a transaction (SQL) or
+	// under one lock (in-memory); the port deliberately does not expose a
+	// transaction handle, which would leak database/sql's shape into it.
+	//
+	// The claimed token's preset labels are merged INTO a.ReportedLabels,
+	// winning over what the agent reported, and the effective set is
+	// recomputed. An operator minting a token for a specific purpose outranks
+	// an agent's self-description. The merge happens here rather than in the
+	// caller because the token's labels are not known until it is claimed, and
+	// splitting the write would leave a window where the agent row exists with
+	// the wrong labels.
+	//
+	// a is updated in place to the stored state, so the caller can report the
+	// effective labels without reading the row back.
+	//
+	// Returns ErrInvalidBootstrap for a token that is unknown, already used or
+	// expired. The three are one error on purpose: an attacker probing tokens
+	// learns nothing about which case they hit.
+	Enroll(ctx context.Context, a *Agent, tokenHash string) (BootstrapToken, error)
+}
+
+// ErrInvalidBootstrap covers an unknown, already-used or expired bootstrap
+// token. Deliberately a single error; see TokenStore.Enroll.
+var ErrInvalidBootstrap = errors.New("pulse: invalid bootstrap token")
+
+// ConfigStore persists pushed agent configuration.
+type ConfigStore interface {
+	// GetAgentConfig returns the override for one agent, ErrNotFound when the
+	// agent has none. "No override" is a normal state, not an error condition:
+	// the agent's local configuration governs.
+	GetAgentConfig(ctx context.Context, agentID string) (AgentConfig, error)
+	// ListAgentConfigs returns every override keyed by agent ID. Dispatch
+	// reads this once per pass rather than per agent.
+	ListAgentConfigs(ctx context.Context) (map[string]AgentConfig, error)
+	// SaveAgentConfig upserts an override and advances its version.
+	SaveAgentConfig(ctx context.Context, cfg *AgentConfig) error
+	// DeleteAgentConfig removes an override entirely, so the agent falls back
+	// to its local configuration on the next push.
+	DeleteAgentConfig(ctx context.Context, agentID string) error
+}
+
+// JobStore persists the work queue.
+//
+// Lease is the method that matters: see its documentation for why it must be a
+// single statement.
+type JobStore interface {
+	// Enqueue inserts jobs as pending.
+	Enqueue(ctx context.Context, jobs []*Job) error
+	// GetJob returns one job, ErrNotFound if there is none.
+	GetJob(ctx context.Context, id string) (Job, error)
+
+	// Lease claims up to limit pending jobs for one agent, marks them leased,
+	// increments their attempt and sets a lease deadline.
+	//
+	// It MUST be a single statement. A SELECT followed by an UPDATE is a race
+	// whenever the caller is not already inside a transaction, and the whole
+	// point of the queue is that no job is ever leased twice.
+	//
+	// On PostgreSQL that means a CTE with FOR UPDATE SKIP LOCKED; on SQLite,
+	// whose single-writer semantics make SKIP LOCKED meaningless and
+	// unsupported, an UPDATE ... WHERE id IN (SELECT ...) RETURNING.
+	Lease(ctx context.Context, agentID string, limit int, leaseFor time.Duration) ([]Job, error)
+	// LeaseOne claims one specific pending job, for an operator-triggered
+	// "run this now" path that should not queue behind a backlog. Returns
+	// ErrConflict if the job is no longer pending — the dispatch loop got it
+	// first and owns delivery.
+	LeaseOne(ctx context.Context, id string, leaseFor time.Duration) (Job, error)
+
+	// Complete marks a leased job done. It must match on status = leased, so a
+	// report arriving after the lease was reclaimed does not resurrect a job
+	// the reaper already returned to the queue; the caller reads ErrNotFound
+	// as "too late, and that is fine".
+	Complete(ctx context.Context, id string) error
+	// Fail records failed work. The job returns to pending while attempts
+	// remain, so a transient error retries rather than being reported as a
+	// real result. Past MaxAttempts it becomes JobFailed.
+	Fail(ctx context.Context, id, reason string) error
+	// Requeue hands a job back WITHOUT burning an attempt, for when no work
+	// happened at all: the agent was full, or the push failed. Counting those
+	// as attempts would let a misconfigured concurrency exhaust the retry
+	// budget and fabricate failures for subjects nothing ever looked at.
+	//
+	// RequeueCount is the brake instead. Past maxRequeues the job is FAILED
+	// rather than returned to the queue: a job handed back that many times is
+	// not meeting a busy agent occasionally, it is stuck behind one that never
+	// has room, and spinning on it forever hides the real problem.
+	//
+	// The ceiling is enforced here, in the same statement as the requeue,
+	// rather than by the caller — so it holds even for a caller that reads a
+	// stale RequeueCount, and cannot be bypassed by calling Requeue directly.
+	Requeue(ctx context.Context, id, reason string, maxRequeues int) error
+	// Cancel terminates a job that is no longer wanted.
+	Cancel(ctx context.Context, id, reason string) error
+
+	// ReclaimExpiredLeases returns timed-out jobs to the queue, and gives up
+	// on those that have burned through MaxAttempts.
+	//
+	// The given-up jobs are returned so the caller can synthesize a result for
+	// each: a subject whose jobs all died silently must show up somewhere as
+	// "not being worked on", not merely stop having rows.
+	ReclaimExpiredLeases(ctx context.Context) (ReclaimStats, error)
+
+	// CountLeasedForAgent is how many jobs an agent currently holds, which is
+	// what dispatch subtracts from its concurrency to get a quota.
+	CountLeasedForAgent(ctx context.Context, agentID string) (int, error)
+	// CountPendingForAgent is backlog depth, for display and for deciding
+	// whether a dispatch pass has anything to do.
+	CountPendingForAgent(ctx context.Context, agentID string) (int, error)
+	// PurgeFinished deletes terminal jobs older than before, returning how
+	// many went. Retention is the application's policy; this is the mechanism.
+	PurgeFinished(ctx context.Context, before time.Time) (int64, error)
+}
+
+// ReclaimStats is what one lease-reaper pass did.
+type ReclaimStats struct {
+	// Requeued is how many jobs went back to pending with attempts left.
+	Requeued int64
+	// Expired are jobs that burned through their attempts. The caller
+	// synthesizes a result for each.
+	Expired []Job
+}
+
+// Registry sends messages down live agent streams. The queue depends on this
+// rather than on the control plane, so dispatch is testable without gRPC.
+type Registry interface {
+	// SendTo pushes a message to one agent. An error means the stream is gone
+	// and the job must be requeued rather than retried on the same handle.
+	SendTo(agentID string, msg *ServerMessage) error
+}
+
+// ServerMessage is one message bound for an agent. Exactly one field is set.
+//
+// This mirrors the proto oneof without making the queue import the generated
+// package: pulsequeue builds these, and the control plane translates them on
+// the way out.
+type ServerMessage struct {
+	Job     *Job
+	Command *Command
+	Config  *AgentConfig
+}
+
+// Command is an instruction to an agent.
+type Command int
+
+const (
+	// CommandReload asks the agent to re-read its local configuration.
+	CommandReload Command = 1
+	// CommandShutdown asks the agent to finish running jobs and exit.
+	CommandShutdown Command = 2
+)
+
+// Sink receives finished work. The application implements it: the framework
+// knows a result arrived, the application knows what it means.
+//
+// Deliver is called from a stream's receive loop, which also carries that
+// agent's heartbeats. An implementation must hand off quickly — anything slow
+// belongs on its own goroutine, or heartbeats stall behind it and the server
+// decides the agent went offline.
+type Sink interface {
+	// Deliver stores one result. accepted=false means the server already has
+	// it (a replay, or an unknown job) and the agent should not retry.
+	Deliver(ctx context.Context, agentID string, r Result) (accepted bool, err error)
+	// Ack reacts to an agent's accept/reject of a dispatched job. Reasons are
+	// the Ack* constants.
+	Ack(agentID string, jobID string, accepted bool, reason string)
+}
