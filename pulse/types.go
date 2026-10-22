@@ -21,7 +21,16 @@ type Job struct {
 	Status  string
 	// Timeout bounds the whole job. Zero means the dispatcher's default.
 	Timeout time.Duration
-	// Attempt counts executions, starting at 1 once leased.
+	// Attempt counts the times an agent has held this job with a chance to
+	// work on it. A lease increments it; a requeue gives it back, because a
+	// requeue means no work was possible (JobStore.Requeue).
+	//
+	// An EXPIRED lease does not give it back, and that asymmetry is the whole
+	// point: a requeue says nothing happened, while an expiry says an agent
+	// took the job and never answered — it may have done the work and died
+	// before reporting. Charging the second and not the first is what keeps
+	// MaxAttempts a budget for real attempts rather than one a busy fleet can
+	// drain on its own.
 	Attempt     int
 	MaxAttempts int
 	// RequeueCount is how often this job was handed back without running — a

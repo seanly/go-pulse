@@ -296,28 +296,32 @@ func testRequeueCeiling(t *testing.T, s Stores) {
 }
 
 func testReclaim(t *testing.T, s Stores) {
-	requireClock(t, s)
 	enqueue(t, s,
-		// Attempts left: recoverable.
+		// Live lease: must survive the pass untouched.
+		&pulse.Job{ID: "fresh", AgentID: "a1", MaxAttempts: 3},
+		// Expired with attempts left: recoverable.
 		&pulse.Job{ID: "retry", AgentID: "a1", MaxAttempts: 3},
-		// One attempt only: the first expiry exhausts it.
+		// Expired with one attempt only: exhausted.
 		&pulse.Job{ID: "doomed", AgentID: "a1", MaxAttempts: 1},
 	)
-	if _, err := s.Jobs.Lease(ctx(), "a1", 2, time.Minute); err != nil {
+
+	// A negative lease duration puts the deadline in the past, which is what
+	// an expired lease IS — no clock needed. That keeps this case runnable
+	// against an implementation whose clock cannot be controlled, which is
+	// most of them: reading the wall clock from a package function is the
+	// obvious way to write a store, and only becomes awkward once someone
+	// wants to test around it.
+	if _, err := s.Jobs.LeaseOne(ctx(), "fresh", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Jobs.LeaseOne(ctx(), "retry", -time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Jobs.LeaseOne(ctx(), "doomed", -time.Minute); err != nil {
 		t.Fatal(err)
 	}
 
-	// Before expiry: nothing to do.
 	stats, err := s.Jobs.ReclaimExpiredLeases(ctx())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stats.Requeued != 0 || len(stats.Expired) != 0 {
-		t.Errorf("reclaimed early: %+v", stats)
-	}
-
-	s.Clock.Advance(2 * time.Minute)
-	stats, err = s.Jobs.ReclaimExpiredLeases(ctx())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,10 +332,23 @@ func testReclaim(t *testing.T, s Stores) {
 		t.Errorf("expired = %+v, want just the exhausted job", stats.Expired)
 	}
 
+	// The live lease is not disturbed by a pass that reclaims its neighbours.
+	fresh, _ := s.Jobs.GetJob(ctx(), "fresh")
+	if fresh.Status != pulse.JobLeased {
+		t.Errorf("live lease status = %q, want it still leased", fresh.Status)
+	}
+
 	retry, _ := s.Jobs.GetJob(ctx(), "retry")
 	if retry.Status != pulse.JobPending {
 		t.Errorf("recoverable job status = %q, want pending", retry.Status)
 	}
+	// The attempt the lease spent is NOT given back here, unlike a requeue: an
+	// agent that took the job and went quiet may well have done the work and
+	// died before reporting, so the attempt was real.
+	if retry.Attempt != 1 {
+		t.Errorf("recoverable job attempt = %d, want 1: an expired lease was a real attempt", retry.Attempt)
+	}
+
 	doomed, _ := s.Jobs.GetJob(ctx(), "doomed")
 	// Expired, not failed: the agent stopped answering, which is a different
 	// problem from work that ran and reported an error. Collapsing them would
@@ -454,7 +471,6 @@ func testCounts(t *testing.T, s Stores) {
 }
 
 func testPurge(t *testing.T, s Stores) {
-	requireClock(t, s)
 	enqueue(t, s,
 		&pulse.Job{ID: "done", AgentID: "a1"},
 		&pulse.Job{ID: "pending", AgentID: "a1"},
@@ -466,8 +482,10 @@ func testPurge(t *testing.T, s Stores) {
 		t.Fatal(err)
 	}
 
-	s.Clock.Advance(time.Hour)
-	n, err := s.Jobs.PurgeFinished(ctx(), time.Now().UTC().Add(30*time.Minute))
+	// A cutoff in the future rather than an advanced clock: the question
+	// PurgeFinished answers is "is this job's finish time before the cutoff",
+	// and moving the cutoff asks it just as well as moving time.
+	n, err := s.Jobs.PurgeFinished(ctx(), time.Now().UTC().Add(time.Hour))
 	if err != nil {
 		t.Fatalf("PurgeFinished: %v", err)
 	}

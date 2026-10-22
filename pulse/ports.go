@@ -57,6 +57,12 @@ type AgentStore interface {
 	//
 	// It must not touch those agents' jobs: a lease has its own expiry, and a
 	// network blip should not requeue work that is still running fine.
+	//
+	// staleFor is used as given, including when it is zero or negative — which
+	// puts the cutoff at or after the present and makes every agent stale.
+	// Implementations must not clamp it. Production never passes a negative
+	// window, but it is how a test reaches this behaviour without a
+	// controllable clock, and clamping would silently turn that test green.
 	MarkStaleAgentsOffline(ctx context.Context, staleFor time.Duration) ([]string, error)
 	// DeleteAgent removes an agent. Its credentials must stop verifying
 	// immediately, which falls out of GetAgent returning ErrNotFound.
@@ -144,6 +150,11 @@ type JobStore interface {
 	// "run this now" path that should not queue behind a backlog. Returns
 	// ErrConflict if the job is no longer pending — the dispatch loop got it
 	// first and owns delivery.
+	//
+	// leaseFor is used as given, including when it is negative — which dates
+	// the lease deadline into the past, making the job immediately reclaimable.
+	// Implementations must not clamp it; it is how a test produces an expired
+	// lease without a controllable clock.
 	LeaseOne(ctx context.Context, id string, leaseFor time.Duration) (Job, error)
 
 	// Complete marks a leased job done. It must match on status = leased, so a

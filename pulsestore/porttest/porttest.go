@@ -34,13 +34,18 @@ type Stores struct {
 	Tokens  pulse.TokenStore
 	Configs pulse.ConfigStore
 	Jobs    pulse.JobStore
-	// Clock is the store's own notion of time, which tests both read and
-	// advance. Reading matters as much as advancing: a test that builds an
-	// expiry from the wall clock while the store runs on a fixed test clock
-	// compares two unrelated timelines and passes or fails by accident.
+	// Clock, when set, is the store's own notion of time, and the suite builds
+	// its timestamps on that timeline rather than the wall clock. A test that
+	// dates an expiry from time.Now() while the store runs on a fixed test
+	// clock is comparing two unrelated timelines, and passes or fails by
+	// accident.
 	//
-	// An implementation whose clock cannot be controlled leaves this nil, and
-	// the time-dependent tests skip.
+	// Optional. No case in the suite requires advancing it: every deadline is
+	// reached by dating it into the past (a negative lease duration, a
+	// negative staleness window, a cutoff in the future) rather than by moving
+	// time. An implementation that reads the wall clock from a package
+	// function — the obvious way to write a store — therefore runs the whole
+	// contract rather than skipping the time-dependent third of it.
 	Clock Clock
 	// CreateAgent inserts an agent row directly, bypassing enrollment. Needed
 	// because most tests want an agent without minting a token first.
@@ -79,11 +84,10 @@ var (
 	FixtureSubjectIDs = []string{"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"}
 )
 
-// Clock is a controllable clock: the suite reads it to build timestamps on the
-// store's timeline and advances it to make deadlines pass.
+// Clock is the store's clock, read so the suite's timestamps land on the same
+// timeline the store writes on. It does not need to be advanceable.
 type Clock interface {
 	Now() time.Time
-	Advance(time.Duration)
 }
 
 // Factory builds a fresh, empty set of stores for one test.
@@ -171,8 +175,10 @@ func mustToken(t *testing.T, s Stores, labels map[string]string, expiresIn time.
 	if s.Clock != nil {
 		now = s.Clock.Now()
 	}
+	// Zero means "never expires"; a negative duration means "already expired",
+	// which is how the expiry case is tested without a controllable clock.
 	var expires time.Time
-	if expiresIn > 0 {
+	if expiresIn != 0 {
 		expires = now.Add(expiresIn)
 	}
 	tok := pulse.BootstrapToken{
@@ -224,13 +230,6 @@ func prepareFixtures(t *testing.T, s Stores) {
 	}
 	if err := s.PrepareJobFixtures(ctx(), FixtureAgentIDs, FixtureSubjectIDs); err != nil {
 		t.Fatalf("prepare job fixtures: %v", err)
-	}
-}
-
-func requireClock(t *testing.T, s Stores) {
-	t.Helper()
-	if s.Clock == nil {
-		t.Skip("implementation does not support a controllable clock")
 	}
 }
 
@@ -358,7 +357,6 @@ func testLabelTombstones(t *testing.T, s Stores) {
 }
 
 func testHeartbeatAndStaleness(t *testing.T, s Stores) {
-	requireClock(t, s)
 	mustAgent(t, s, pulse.Agent{ID: "a1", Name: "probe-1", Status: pulse.AgentOffline})
 
 	if err := s.Agents.Heartbeat(ctx(), "a1", "2.0.0", "203.0.113.9"); err != nil {
@@ -382,9 +380,13 @@ func testHeartbeatAndStaleness(t *testing.T, s Stores) {
 		t.Error("heartbeat timestamp not recorded")
 	}
 
-	// Inside the window: nothing happens.
-	s.Clock.Advance(pulse.StaleTimeout - time.Second)
-	ids, err := s.Agents.MarkStaleAgentsOffline(ctx(), pulse.StaleTimeout)
+	// Staleness is "older than now minus this window", so shrinking the window
+	// asks the same question as advancing a clock — and works against an
+	// implementation whose clock cannot be controlled.
+	//
+	// A generous window: the heartbeat above is a moment old, so nothing is
+	// stale yet.
+	ids, err := s.Agents.MarkStaleAgentsOffline(ctx(), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,9 +394,10 @@ func testHeartbeatAndStaleness(t *testing.T, s Stores) {
 		t.Errorf("marked %v offline too early", ids)
 	}
 
-	// Past it: offline, and the ID is reported so the caller can log it.
-	s.Clock.Advance(2 * time.Second)
-	ids, err = s.Agents.MarkStaleAgentsOffline(ctx(), pulse.StaleTimeout)
+	// A negative window puts the cutoff in the future, so every heartbeat is
+	// stale — including one from this instant. The ID comes back so the caller
+	// can log the transition.
+	ids, err = s.Agents.MarkStaleAgentsOffline(ctx(), -time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,15 +535,15 @@ func testEnrollClaimsOnce(t *testing.T, s Stores) {
 }
 
 func testEnrollRejects(t *testing.T, s Stores) {
-	requireClock(t, s)
 	used := mustToken(t, s, nil, 0)
 	a := pulse.Agent{ID: "a1", Name: "probe-1", TokenVersion: 1}
 	if _, err := s.Tokens.Enroll(ctx(), &a, used); err != nil {
 		t.Fatal(err)
 	}
 
-	expired := mustToken(t, s, nil, time.Minute)
-	s.Clock.Advance(2 * time.Minute)
+	// Minted with an expiry already behind it, rather than advancing a clock
+	// past a future one. An expired token is an expired token.
+	expired := mustToken(t, s, nil, -time.Minute)
 
 	// All three must be the same error: an attacker probing tokens learns
 	// nothing about which case they hit.
